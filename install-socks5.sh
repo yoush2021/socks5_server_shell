@@ -234,7 +234,7 @@ import (
 var (
 	port     = flag.Int("port", 1080, "SOCKS5 server port")
 	username = flag.String("user", "admin", "Username for authentication")
-	password = flag.String("pass", "admin123", "Password for authentication")
+	password = flag.String("pass", "admin", "Password for authentication")
 	verbose  = flag.Bool("verbose", true, "Enable verbose logging")
 )
 
