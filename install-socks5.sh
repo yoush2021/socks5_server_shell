@@ -8,7 +8,7 @@ REPO_URL="https://github.com/yoush2021/socks5_server_shell"
 SCRIPT_URL="https://raw.githubusercontent.com/yoush2021/socks5_server_shell/main"
 DEFAULT_PORT=1080
 DEFAULT_USER="admin"
-DEFAULT_PASS="admin123"
+DEFAULT_PASS="admin"
 INSTALL_DIR="/usr/local/bin"
 SERVICE_NAME="socks5-server"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -470,8 +470,9 @@ verify_installation() {
 
 # 显示安装结果
 show_installation_result() {
-    local server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-    if [[ -z "$server_ip" ]]; then
+    #local server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    local server_ip=$(wget -qO- "http://4.ipw.cn")
+	if [[ -z "$server_ip" ]]; then
         server_ip="你的服务器IP"
     fi
     
