@@ -94,7 +94,7 @@ uname -m
 安装完成后，使用以下命令测试：
 
 ```bash
-curl --socks5 admin:admin123@服务器IP:1080 http://4.ipw.cn
+curl --socks5 admin:admin@服务器IP:1080 http://4.ipw.cn
 ```
 
 ## 🐛 问题排查
