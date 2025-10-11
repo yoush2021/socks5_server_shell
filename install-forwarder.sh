@@ -1,5 +1,5 @@
 #!/bin/bash
-# install-socks5-forwarder.sh - SOCKS5代理转发服务器
+# install-socks5-proxy.sh - SOCKS5代理转发服务器 (整合修复版)
 
 set -e
 
@@ -8,10 +8,10 @@ DEFAULT_ENTRY_PORT=1080
 DEFAULT_ENTRY_USER="admin"
 DEFAULT_ENTRY_PASS="admin"
 INSTALL_DIR="/usr/local/bin"
-SERVICE_NAME="socks5-forwarder"
+SERVICE_NAME="socks5-proxy"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-CONFIG_DIR="/etc/socks5-forwarder"
-LOG_FILE="/var/log/socks5-forwarder.log"
+CONFIG_DIR="/etc/socks5-proxy"
+LOG_FILE="/var/log/socks5-proxy.log"
 
 # 颜色输出
 RED='\033[0;31m'
@@ -38,6 +38,7 @@ show_banner() {
                                                    
             SOCKS5 代理转发服务器
             VPS1 → VPS2 代理链
+            GitHub: yoush2021/socks5_server_shell
                                                                     
 EOF
 }
@@ -58,7 +59,13 @@ get_vps2_info() {
     while true; do
         read -p "VPS2服务器IP地址: " VPS2_IP
         if [[ -n "$VPS2_IP" ]]; then
-            break
+            # 简单IP格式验证
+            if [[ $VPS2_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                break
+            else
+                log_warn "IP地址格式可能不正确，但继续使用: $VPS2_IP"
+                break
+            fi
         else
             log_error "IP地址不能为空"
         fi
@@ -103,18 +110,8 @@ get_vps1_config() {
     echo
     log_info "=== 配置VPS1入口代理 ==="
     
-    while true; do
-        read -p "VPS1监听端口 [默认: $DEFAULT_ENTRY_PORT]: " entry_port
-        if [[ -z "$entry_port" ]]; then
-            ENTRY_PORT=$DEFAULT_ENTRY_PORT
-            break
-        elif [[ "$entry_port" =~ ^[0-9]+$ ]] && [ "$entry_port" -ge 1024 ] && [ "$entry_port" -le 65535 ]; then
-            ENTRY_PORT=$entry_port
-            break
-        else
-            log_error "端口号必须是1024-65535之间的数字"
-        fi
-    done
+    read -p "VPS1监听端口 [默认: $DEFAULT_ENTRY_PORT]: " entry_port
+    ENTRY_PORT=${entry_port:-$DEFAULT_ENTRY_PORT}
     
     read -p "VPS1认证用户名 [默认: $DEFAULT_ENTRY_USER]: " entry_user
     ENTRY_USER=${entry_user:-$DEFAULT_ENTRY_USER}
@@ -128,7 +125,7 @@ get_vps1_config() {
     log_info "配置摘要:"
     echo "═══════════════════════════════════════"
     echo "  VPS1 (入口): 0.0.0.0:$ENTRY_PORT"
-    echo "  认证: $ENTRY_USER / ***"
+    echo "  认证: $ENTRY_USER / $ENTRY_PASS"
     echo "  VPS2 (出口): $VPS2_IP:$VPS2_PORT"
     if [[ -n "$VPS2_USER" ]]; then
         echo "  认证: $VPS2_USER / ***"
@@ -193,29 +190,28 @@ install_go() {
     fi
 }
 
-# 编译SOCKS5转发服务器
-compile_forwarder() {
+# 编译SOCKS5转发服务器（整合修复版）
+compile_proxy_server() {
     log_info "编译SOCKS5代理转发服务器..."
     
     # 创建临时构建目录
-    local build_dir="/tmp/socks5-forwarder-$$"
+    local build_dir="/tmp/socks5-proxy-$$"
     mkdir -p "$build_dir"
     cd "$build_dir"
     
     # 创建Go模块
     cat > go.mod << 'EOF'
-module socks5-forwarder
+module socks5-proxy
 
 go 1.21
 EOF
 
-    # 创建SOCKS5转发服务器代码
-    cat > main.go << EOF
+    # 创建SOCKS5转发服务器代码（整合修复版）
+    cat > main.go << 'EOF'
 package main
 
 import (
 	"encoding/binary"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -229,13 +225,14 @@ import (
 
 // 配置参数
 var (
-	entryPort    = flag.Int("entry-port", 1080, "VPS1监听端口")
-	entryUser    = flag.String("entry-user", "admin", "VPS1认证用户名")
-	entryPass    = flag.String("entry-pass", "admin", "VPS1认证密码")
-	exitServer   = flag.String("exit-server", "", "VPS2服务器地址 (IP:端口)")
-	exitUser     = flag.String("exit-user", "", "VPS2认证用户名")
-	exitPass     = flag.String("exit-pass", "", "VPS2认证密码")
-	verbose      = flag.Bool("verbose", true, "详细日志")
+	entryPort  = flag.Int("entry-port", 1080, "VPS1监听端口")
+	entryUser  = flag.String("entry-user", "admin", "VPS1认证用户名")
+	entryPass  = flag.String("entry-pass", "admin", "VPS1认证密码")
+	exitIP     = flag.String("exit-ip", "", "VPS2服务器地址")
+	exitPort   = flag.Int("exit-port", 1080, "VPS2 SOCKS5端口")
+	exitUser   = flag.String("exit-user", "", "VPS2认证用户名")
+	exitPass   = flag.String("exit-pass", "", "VPS2认证密码")
+	verbose    = flag.Bool("verbose", true, "详细日志")
 )
 
 const (
@@ -247,35 +244,39 @@ const (
 	atypDomain    = 0x03
 )
 
-type Forwarder struct {
-	exitServer string
-	exitUser   string
-	exitPass   string
-	verbose    bool
+type ProxyServer struct {
+	exitIP   string
+	exitPort int
+	exitUser string
+	exitPass string
+	verbose  bool
 }
 
-func NewForwarder(exitServer, exitUser, exitPass string, verbose bool) *Forwarder {
-	return &Forwarder{
-		exitServer: exitServer,
-		exitUser:   exitUser,
-		exitPass:   exitPass,
-		verbose:    verbose,
+func NewProxyServer(exitIP string, exitPort int, exitUser, exitPass string, verbose bool) *ProxyServer {
+	return &ProxyServer{
+		exitIP:   exitIP,
+		exitPort: exitPort,
+		exitUser: exitUser,
+		exitPass: exitPass,
+		verbose:  verbose,
 	}
 }
 
-func (f *Forwarder) StartEntryServer(port int, username, password string) error {
+func (p *ProxyServer) Start(port int, username, password string) error {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		return fmt.Errorf("监听端口失败: %v", err)
 	}
 	defer listener.Close()
 
-	if f.verbose {
+	if p.verbose {
 		log.Printf("🚀 SOCKS5代理转发服务器启动")
 		log.Printf("📍 入口: 0.0.0.0:%d (用户: %s)", port, username)
-		log.Printf("🎯 出口: %s", f.exitServer)
-		if f.exitUser != "" {
-			log.Printf("🔑 VPS2认证: %s", f.exitUser)
+		log.Printf("🎯 出口: %s:%d", p.exitIP, p.exitPort)
+		if p.exitUser != "" {
+			log.Printf("🔑 VPS2认证: %s", p.exitUser)
+		} else {
+			log.Printf("🔑 VPS2认证: 无")
 		}
 	}
 
@@ -292,102 +293,101 @@ func (f *Forwarder) StartEntryServer(port int, username, password string) error 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			if f.verbose {
+			if p.verbose {
 				log.Printf("接受连接错误: %v", err)
 			}
 			continue
 		}
 
-		go f.handleEntryConnection(conn, username, password)
+		go p.handleConnection(conn, username, password)
 	}
 }
 
-func (f *Forwarder) handleEntryConnection(conn net.Conn, username, password string) {
+func (p *ProxyServer) handleConnection(conn net.Conn, username, password string) {
 	defer conn.Close()
 	clientAddr := conn.RemoteAddr().String()
 
-	if f.verbose {
+	if p.verbose {
 		log.Printf("📥 新连接来自: %s", clientAddr)
 	}
 
 	// VPS1端SOCKS5认证
-	if err := f.authenticate(conn, username, password); err != nil {
-		if f.verbose {
+	if err := p.handleAuth(conn, username, password); err != nil {
+		if p.verbose {
 			log.Printf("❌ VPS1认证失败 %s: %v", clientAddr, err)
 		}
 		return
 	}
 
 	// 处理SOCKS5请求
-	if err := f.handleRequest(conn, clientAddr); err != nil {
-		if f.verbose {
+	if err := p.handleRequest(conn, clientAddr); err != nil {
+		if p.verbose {
 			log.Printf("❌ 请求处理失败 %s: %v", clientAddr, err)
 		}
 	} else {
-		if f.verbose {
+		if p.verbose {
 			log.Printf("✅ 连接完成: %s", clientAddr)
 		}
 	}
 }
 
-func (f *Forwarder) authenticate(conn net.Conn, username, password string) error {
+func (p *ProxyServer) handleAuth(conn net.Conn, username, password string) error {
 	buf := make([]byte, 256)
 
 	// 读取认证方法
 	n, err := conn.Read(buf)
 	if err != nil || n < 2 || buf[0] != socksVersion5 {
-		return errors.New("无效的SOCKS版本")
+		return fmt.Errorf("无效的SOCKS版本")
 	}
 
-	// 发送无需认证
+	// 发送认证方法
 	if username == "" {
 		_, err = conn.Write([]byte{socksVersion5, authNone})
-		return err
+	} else {
+		_, err = conn.Write([]byte{socksVersion5, authPassword})
 	}
-
-	// 发送用户名密码认证
-	_, err = conn.Write([]byte{socksVersion5, authPassword})
 	if err != nil {
 		return err
 	}
 
-	// 读取认证数据
-	n, err = conn.Read(buf)
-	if err != nil || n < 3 || buf[0] != 0x01 {
-		return errors.New("无效的认证数据")
+	// 用户名密码认证
+	if username != "" {
+		n, err = conn.Read(buf)
+		if err != nil || n < 3 || buf[0] != 0x01 {
+			return fmt.Errorf("无效的认证数据")
+		}
+
+		ulen := int(buf[1])
+		if n < 2+ulen+1 {
+			return fmt.Errorf("无效的用户名长度")
+		}
+
+		plen := int(buf[2+ulen])
+		if n != 2+ulen+1+plen {
+			return fmt.Errorf("无效的密码长度")
+		}
+
+		user := string(buf[2 : 2+ulen])
+		pass := string(buf[3+ulen : 3+ulen+plen])
+
+		if user != username || pass != password {
+			conn.Write([]byte{0x01, 0x01})
+			return fmt.Errorf("认证失败")
+		}
+
+		conn.Write([]byte{0x01, 0x00})
 	}
 
-	// 验证用户名密码
-	ulen := int(buf[1])
-	if n < 2+ulen+1 {
-		return errors.New("无效的认证长度")
-	}
-
-	plen := int(buf[2+ulen])
-	if n != 2+ulen+1+plen {
-		return errors.New("无效的密码长度")
-	}
-
-	user := string(buf[2 : 2+ulen])
-	pass := string(buf[3+ulen : 3+ulen+plen])
-
-	if user != username || pass != password {
-		conn.Write([]byte{0x01, 0x01})
-		return errors.New("认证失败")
-	}
-
-	// 认证成功
-	_, err = conn.Write([]byte{0x01, 0x00})
-	return err
+	return nil
 }
 
-func (f *Forwarder) handleRequest(conn net.Conn, clientAddr string) error {
+func (p *ProxyServer) handleRequest(conn net.Conn, clientAddr string) error {
 	buf := make([]byte, 256)
 
 	// 读取SOCKS5请求
 	n, err := conn.Read(buf)
 	if err != nil || n < 4 || buf[0] != socksVersion5 {
-		return errors.New("无效的SOCKS请求")
+		return fmt.Errorf("无效的SOCKS请求")
 	}
 
 	cmd := buf[1]
@@ -395,8 +395,8 @@ func (f *Forwarder) handleRequest(conn net.Conn, clientAddr string) error {
 
 	// 只支持CONNECT命令
 	if cmd != cmdConnect {
-		f.sendReply(conn, 0x07, nil) // Command not supported
-		return errors.New("不支持的命令")
+		p.sendReply(conn, 0x07, nil) // Command not supported
+		return fmt.Errorf("不支持的命令")
 	}
 
 	// 解析目标地址
@@ -406,53 +406,55 @@ func (f *Forwarder) handleRequest(conn net.Conn, clientAddr string) error {
 	switch atyp {
 	case atypIPv4:
 		if n < 10 {
-			return errors.New("无效的IPv4地址")
+			return fmt.Errorf("无效的IPv4地址")
 		}
 		host = net.IPv4(buf[4], buf[5], buf[6], buf[7]).String()
 		port = binary.BigEndian.Uint16(buf[8:10])
 	case atypDomain:
 		domainLen := int(buf[4])
 		if n < 7+domainLen {
-			return errors.New("无效的域名长度")
+			return fmt.Errorf("无效的域名长度")
 		}
 		host = string(buf[5 : 5+domainLen])
 		port = binary.BigEndian.Uint16(buf[5+domainLen : 7+domainLen])
 	default:
-		f.sendReply(conn, 0x08, nil) // Address type not supported
-		return errors.New("不支持的地址类型")
+		p.sendReply(conn, 0x08, nil) // Address type not supported
+		return fmt.Errorf("不支持的地址类型")
 	}
 
 	targetAddr := fmt.Sprintf("%s:%d", host, port)
 
-	if f.verbose {
+	if p.verbose {
 		log.Printf("🔗 连接目标: %s (来自: %s)", targetAddr, clientAddr)
 	}
 
 	// 连接到VPS2 SOCKS5代理
-	exitConn, err := f.connectToExitServer(targetAddr)
+	exitConn, err := p.connectToExitServer(targetAddr)
 	if err != nil {
-		f.sendReply(conn, 0x01, nil) // General failure
+		p.sendReply(conn, 0x01, nil) // General failure
 		return fmt.Errorf("连接到VPS2失败: %v", err)
 	}
 	defer exitConn.Close()
 
 	// 发送成功响应
-	f.sendReply(conn, 0x00, exitConn.LocalAddr().(*net.TCPAddr))
+	localAddr := exitConn.LocalAddr().(*net.TCPAddr)
+	p.sendReply(conn, 0x00, localAddr)
 
 	// 开始双向数据转发
-	return f.forwardData(conn, exitConn, clientAddr, targetAddr)
+	return p.forwardData(conn, exitConn, clientAddr, targetAddr)
 }
 
-func (f *Forwarder) connectToExitServer(targetAddr string) (net.Conn, error) {
+func (p *ProxyServer) connectToExitServer(targetAddr string) (net.Conn, error) {
 	// 连接到VPS2 SOCKS5代理
-	conn, err := net.DialTimeout("tcp", f.exitServer, 10*time.Second)
+	exitServer := fmt.Sprintf("%s:%d", p.exitIP, p.exitPort)
+	conn, err := net.DialTimeout("tcp", exitServer, 10*time.Second)
 	if err != nil {
 		return nil, err
 	}
 
 	// VPS2 SOCKS5认证协商
 	authMethods := []byte{socksVersion5, 1, authNone}
-	if f.exitUser != "" {
+	if p.exitUser != "" {
 		authMethods = []byte{socksVersion5, 1, authPassword}
 	}
 
@@ -461,21 +463,21 @@ func (f *Forwarder) connectToExitServer(targetAddr string) (net.Conn, error) {
 		return nil, err
 	}
 
-	// 读取认证方法响应
+	// 读取VPS2认证响应
 	resp := make([]byte, 2)
 	if _, err := io.ReadFull(conn, resp); err != nil || resp[0] != socksVersion5 {
 		conn.Close()
-		return nil, errors.New("VPS2认证协商失败")
+		return nil, fmt.Errorf("VPS2认证协商失败")
 	}
 
-	// 用户名密码认证
-	if f.exitUser != "" && resp[1] == authPassword {
-		authReq := make([]byte, 3+len(f.exitUser)+len(f.exitPass))
+	// VPS2用户名密码认证
+	if p.exitUser != "" && resp[1] == authPassword {
+		authReq := make([]byte, 3+len(p.exitUser)+len(p.exitPass))
 		authReq[0] = 0x01
-		authReq[1] = byte(len(f.exitUser))
-		copy(authReq[2:], f.exitUser)
-		authReq[2+len(f.exitUser)] = byte(len(f.exitPass))
-		copy(authReq[3+len(f.exitUser):], f.exitPass)
+		authReq[1] = byte(len(p.exitUser))
+		copy(authReq[2:], p.exitUser)
+		authReq[2+len(p.exitUser)] = byte(len(p.exitPass))
+		copy(authReq[3+len(p.exitUser):], p.exitPass)
 
 		if _, err := conn.Write(authReq); err != nil {
 			conn.Close()
@@ -485,7 +487,7 @@ func (f *Forwarder) connectToExitServer(targetAddr string) (net.Conn, error) {
 		authResp := make([]byte, 2)
 		if _, err := io.ReadFull(conn, authResp); err != nil || authResp[1] != 0x00 {
 			conn.Close()
-			return nil, errors.New("VPS2认证失败")
+			return nil, fmt.Errorf("VPS2认证失败")
 		}
 	}
 
@@ -495,7 +497,7 @@ func (f *Forwarder) connectToExitServer(targetAddr string) (net.Conn, error) {
 	connectReq[1] = cmdConnect
 	connectReq[2] = 0x00
 	connectReq[3] = atypIPv4
-	// 目标地址会在VPS2端解析，这里发送空地址
+	// 使用空地址，让VPS2解析实际目标
 	if _, err := conn.Write(connectReq); err != nil {
 		conn.Close()
 		return nil, err
@@ -505,13 +507,13 @@ func (f *Forwarder) connectToExitServer(targetAddr string) (net.Conn, error) {
 	connectResp := make([]byte, 10)
 	if _, err := io.ReadFull(conn, connectResp); err != nil || connectResp[1] != 0x00 {
 		conn.Close()
-		return nil, errors.New("VPS2连接失败")
+		return nil, fmt.Errorf("VPS2连接失败")
 	}
 
 	return conn, nil
 }
 
-func (f *Forwarder) forwardData(clientConn, exitConn net.Conn, clientAddr, targetAddr string) error {
+func (p *ProxyServer) forwardData(clientConn, exitConn net.Conn, clientAddr, targetAddr string) error {
 	done := make(chan error, 2)
 
 	// 客户端 → VPS2
@@ -528,9 +530,9 @@ func (f *Forwarder) forwardData(clientConn, exitConn net.Conn, clientAddr, targe
 
 	// 等待任一方向完成
 	err := <-done
-	if f.verbose {
-		if err != nil {
-			log.Printf("🔌 连接关闭 %s → %s: %v", clientAddr, targetAddr, err)
+	if p.verbose {
+		if err != nil && err != io.EOF {
+			log.Printf("🔌 连接错误 %s → %s: %v", clientAddr, targetAddr, err)
 		} else {
 			log.Printf("🔌 连接正常关闭 %s → %s", clientAddr, targetAddr)
 		}
@@ -539,7 +541,7 @@ func (f *Forwarder) forwardData(clientConn, exitConn net.Conn, clientAddr, targe
 	return err
 }
 
-func (f *Forwarder) sendReply(conn net.Conn, replyCode byte, addr *net.TCPAddr) error {
+func (p *ProxyServer) sendReply(conn net.Conn, replyCode byte, addr *net.TCPAddr) error {
 	var reply []byte
 
 	if addr != nil {
@@ -568,13 +570,13 @@ func (f *Forwarder) sendReply(conn net.Conn, replyCode byte, addr *net.TCPAddr) 
 func main() {
 	flag.Parse()
 
-	if *exitServer == "" {
+	if *exitIP == "" {
 		log.Fatal("必须指定VPS2服务器地址")
 	}
 
-	forwarder := NewForwarder(*exitServer, *exitUser, *exitPass, *verbose)
+	server := NewProxyServer(*exitIP, *exitPort, *exitUser, *exitPass, *verbose)
 	
-	if err := forwarder.StartEntryServer(*entryPort, *entryUser, *entryPass); err != nil {
+	if err := server.Start(*entryPort, *entryUser, *entryPass); err != nil {
 		log.Fatalf("服务器启动失败: %v", err)
 	}
 }
@@ -582,9 +584,9 @@ EOF
 
     # 编译
     export GO111MODULE=on
-    if go build -ldflags="-s -w" -o "$INSTALL_DIR/socks5-forwarder" main.go; then
-        chmod +x "$INSTALL_DIR/socks5-forwarder"
-        log_info "✅ SOCKS5转发服务器编译成功"
+    if go build -ldflags="-s -w" -o "$INSTALL_DIR/socks5-proxy" main.go; then
+        chmod +x "$INSTALL_DIR/socks5-proxy"
+        log_info "✅ SOCKS5代理转发服务器编译成功"
     else
         log_error "❌ 编译失败"
         cd /
@@ -603,7 +605,7 @@ create_config() {
     
     mkdir -p "$CONFIG_DIR"
     
-    cat > "$CONFIG_DIR/forwarder.conf" << EOF
+    cat > "$CONFIG_DIR/proxy.conf" << EOF
 # SOCKS5代理转发配置
 # 生成时间: $(date)
 
@@ -619,8 +621,8 @@ VPS2_USER=$VPS2_USER
 VPS2_PASS=$VPS2_PASS
 EOF
 
-    chmod 600 "$CONFIG_DIR/forwarder.conf"
-    log_info "配置文件已创建: $CONFIG_DIR/forwarder.conf"
+    chmod 600 "$CONFIG_DIR/proxy.conf"
+    log_info "配置文件已创建: $CONFIG_DIR/proxy.conf"
 }
 
 # 创建systemd服务
@@ -628,7 +630,7 @@ create_systemd_service() {
     log_info "创建systemd服务..."
     
     # 构建启动命令
-    local start_cmd="$INSTALL_DIR/socks5-forwarder -entry-port $ENTRY_PORT -entry-user \"$ENTRY_USER\" -entry-pass \"$ENTRY_PASS\" -exit-server \"$VPS2_IP:$VPS2_PORT\""
+    local start_cmd="$INSTALL_DIR/socks5-proxy -entry-port $ENTRY_PORT -entry-user \"$ENTRY_USER\" -entry-pass \"$ENTRY_PASS\" -exit-ip \"$VPS2_IP\" -exit-port $VPS2_PORT"
     
     if [[ -n "$VPS2_USER" ]]; then
         start_cmd="$start_cmd -exit-user \"$VPS2_USER\" -exit-pass \"$VPS2_PASS\""
@@ -681,17 +683,11 @@ configure_firewall() {
         firewall-cmd --reload
         log_info "✅ Firewalld已放行端口: $ENTRY_PORT"
     fi
-    
-    # 通用iptables规则
-    if command -v iptables >/dev/null 2>&1; then
-        iptables -I INPUT -p tcp --dport $ENTRY_PORT -j ACCEPT 2>/dev/null && \
-        log_info "✅ iptables已放行端口: $ENTRY_PORT" || true
-    fi
 }
 
 # 启动服务
 start_service() {
-    log_info "启动SOCKS5转发服务..."
+    log_info "启动SOCKS5代理服务..."
     
     systemctl daemon-reload
     systemctl enable $SERVICE_NAME
@@ -700,7 +696,7 @@ start_service() {
     sleep 3
     
     if systemctl is-active --quiet $SERVICE_NAME; then
-        log_info "✅ SOCKS5转发服务器启动成功!"
+        log_info "✅ SOCKS5代理服务器启动成功!"
     else
         log_error "❌ 服务启动失败"
         log_info "查看日志: journalctl -u $SERVICE_NAME -n 20 --no-pager"
@@ -757,11 +753,7 @@ show_installation_result() {
     echo "   ▸ 客户端 → VPS1:$ENTRY_PORT → VPS2:$VPS2_PORT → 目标网站"
     echo
     echo "🔧 测试命令:"
-    if [[ -n "$ENTRY_USER" ]]; then
-        echo "   curl --socks5 $ENTRY_USER:$ENTRY_PASS@$vps1_ip:$ENTRY_PORT http://4.ipw.cn"
-    else
-        echo "   curl --socks5 $vps1_ip:$ENTRY_PORT http://4.ipw.cn"
-    fi
+    echo "   curl --socks5 $ENTRY_USER:$ENTRY_PASS@$vps1_ip:$ENTRY_PORT http://4.ipw.cn"
     echo
     echo "⚙️  管理命令:"
     echo "   systemctl status $SERVICE_NAME    # 查看状态"
@@ -782,7 +774,7 @@ main_install() {
     get_vps1_config
     install_dependencies
     install_go
-    compile_forwarder
+    compile_proxy_server
     create_config
     create_systemd_service
     configure_firewall
@@ -812,6 +804,11 @@ show_help() {
     $0 install      # 交互式安装
     $0 status       # 查看状态
 
+默认配置:
+    ▸ 端口: 1080
+    ▸ 用户名: admin  
+    ▸ 密码: admin
+
 功能:
     📍 在VPS1部署SOCKS5代理转发
     🔗 将流量转发到VPS2现有SOCKS5代理
@@ -822,22 +819,22 @@ EOF
 
 # 卸载功能
 uninstall_server() {
-    log_info "开始卸载SOCKS5转发服务器..."
+    log_info "开始卸载SOCKS5代理服务器..."
     
     systemctl stop $SERVICE_NAME 2>/dev/null || true
     systemctl disable $SERVICE_NAME 2>/dev/null || true
     rm -f $SERVICE_FILE
-    rm -f $INSTALL_DIR/socks5-forwarder
+    rm -f $INSTALL_DIR/socks5-proxy
     rm -rf $CONFIG_DIR
     systemctl daemon-reload
     
-    log_info "✅ SOCKS5转发服务器已卸载"
+    log_info "✅ SOCKS5代理服务器已卸载"
 }
 
 # 显示状态
 show_status() {
     echo
-    log_info "=== SOCKS5转发服务器状态 ==="
+    log_info "=== SOCKS5代理服务器状态 ==="
     systemctl status $SERVICE_NAME --no-pager
     
     echo
@@ -851,6 +848,29 @@ show_status() {
     echo
     log_info "=== 最近日志 ==="
     journalctl -u $SERVICE_NAME -n 10 --no-pager
+}
+
+# 快速修复功能
+quick_fix() {
+    log_info "执行快速修复..."
+    
+    systemctl stop $SERVICE_NAME 2>/dev/null || true
+    pkill -f socks5-proxy 2>/dev/null || true
+    
+    sleep 2
+    
+    systemctl daemon-reload
+    systemctl start $SERVICE_NAME
+    
+    sleep 2
+    
+    if systemctl is-active --quiet $SERVICE_NAME; then
+        log_info "✅ 修复成功"
+        show_status
+    else
+        log_error "❌ 修复失败"
+        journalctl -u $SERVICE_NAME -n 20 --no-pager
+    fi
 }
 
 # 脚本入口
@@ -867,6 +887,9 @@ case "${1:-install}" in
     restart)
         systemctl restart $SERVICE_NAME
         show_status
+        ;;
+    fix)
+        quick_fix
         ;;
     help|--help|-h)
         show_help
