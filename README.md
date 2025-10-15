@@ -19,6 +19,13 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/yoush2021/socks5_server_
 # 或使用wget
 bash -c "$(wget -qO- https://raw.githubusercontent.com/yoush2021/socks5_server_shell/main/install-socks5.sh)"
 ```
+```bash
+# 一键安装 (自动检测架构) 单节点、转发版整合版
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/yoush2021/socks5_server_shell/main/install-socks5NF.sh)"
+
+# 或使用wget 单节点、转发版整合版
+bash -c "$(wget -qO- https://raw.githubusercontent.com/yoush2021/socks5_server_shell/main/install-socks5NF.sh)"
+```
 
 ### 树莓派专用
 
